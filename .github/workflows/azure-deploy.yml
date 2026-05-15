@@ -6,37 +6,46 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Read app name from publish profile
-        id: publish-profile
+      - name: Package site
+        shell: pwsh
+        run: |
+          Compress-Archive -Path laurel/* -DestinationPath app.zip -Force
+
+      - name: Deploy with publish profile
         shell: pwsh
         env:
-          AZURE_APP_SERVICE_PUBLISH_PROFILE: ${{ secrets.AZURE_APP_SERVICE_PUBLISH_PROFILE }}
+          PUBLISH_PROFILE: ${{ secrets.AZURE_APP_SERVICE_PUBLISH_PROFILE }}
         run: |
-          [xml]$publishProfile = $env:AZURE_APP_SERVICE_PUBLISH_PROFILE
-          $webDeployProfile = $publishProfile.publishData.publishProfile |
-            Where-Object { $_.publishMethod -eq 'MSDeploy' } |
-            Select-Object -First 1
-
-          if (-not $webDeployProfile) {
-            throw "Publish profile does not contain an MSDeploy profile."
+          if ([string]::IsNullOrWhiteSpace($env:PUBLISH_PROFILE)) {
+            throw "Missing GitHub secret AZURE_APP_SERVICE_PUBLISH_PROFILE."
           }
 
-          "app_name=$($webDeployProfile.msdeploySite)" >> $env:GITHUB_OUTPUT
+          [xml]$publishProfile = $env:PUBLISH_PROFILE
+          $profile = $publishProfile.publishData.publishProfile |
+            Where-Object { $_.publishMethod -in @('MSDeploy', 'ZipDeploy') } |
+            Select-Object -First 1
 
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ steps.publish-profile.outputs.app_name }}
-          publish-profile: ${{ secrets.AZURE_APP_SERVICE_PUBLISH_PROFILE }}
-          package: laurel
+          if (-not $profile) {
+            throw "Publish profile does not contain an MSDeploy or ZipDeploy profile."
+          }
+
+          $publishHost = $profile.publishUrl -replace '^https?://', ''
+          $publishHost = $publishHost -replace '/.*$', ''
+          $deployUrl = "https://$publishHost/api/zipdeploy?isAsync=false"
+          $pair = "$($profile.userName):$($profile.userPWD)"
+          $token = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+
+          Invoke-RestMethod `
+            -Uri $deployUrl `
+            -Method Post `
+            -Headers @{ Authorization = "Basic $token" } `
+            -ContentType "application/zip" `
+            -InFile app.zip
